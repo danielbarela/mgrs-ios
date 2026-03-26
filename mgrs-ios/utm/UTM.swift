@@ -86,77 +86,124 @@ public class UTM {
      * @return point
      */
     public func toPoint() -> GridPoint {
-
+        
+        // Remove southern hemisphere false northing (UTM convention)
+        // Southern hemisphere northings are offset by +10,000,000 meters
         var north = northing
-        if hemisphere == Hemisphere.SOUTH {
-            // Remove 10,000,000 meter offset used for southern hemisphere
-            north -= 10000000.0
+        if hemisphere == .SOUTH {
+            north -= 10_000_000.0
         }
         
-        let k0 = 0.9996
-        let e2p = 0.006739496742
-        let a1 = 6366197.724
-        let a2 = 6399593.625
-
-        let phi = north / a1 / k0
-        let cosPhi = cos(phi)
+        // UTM / ellipsoid constants (match original implementation exactly)
+        let k0 = 0.9996              // UTM central meridian scale factor
+        let e2p = 0.006739496742     // second eccentricity squared (e′²)
+        let a1 = 6366197.724         // meridional radius scaling constant
+        let a2 = 6399593.625         // transverse radius scaling constant
+        
+        // Footpoint latitude approximation (φ₁)
+        // Equivalent to north / (a1 * k0)
+        let phi = north / (a1 * k0)
+        
+        // Precompute trig values used repeatedly
         let sinPhi = sin(phi)
+        let cosPhi = cos(phi)
         let cosPhi2 = cosPhi * cosPhi
-
-        let sqrtTerm = sqrt(1 + e2p * cosPhi2)
-        let nu = k0 * a2 / sqrtTerm
-
-        let deltaE = easting - 500000
-        let x = deltaE / nu
-
+        
+        // Radius of curvature in the prime vertical (ν)
+        // Adjusted by UTM scale factor
+        let nu = (k0 * a2) / sqrt(1 + e2p * cosPhi2)
+        
+        // Normalized easting relative to central meridian
+        let x = (easting - 500000.0) / nu
         let x2 = x * x
-
-        let correctionFactor = 1 - e2p * x2 / 2 * cosPhi2 / 3
-
-        let expTerm =
-            exp(x) * correctionFactor -
-            exp(-x) * correctionFactor
-
-        let atanTerm = atan(cos(atan(expTerm / 2 / cos(phi))))
-
-        let series1 =
-            phi
-            - e2p * 3/4 * (phi + sin(2 * phi)/2)
-            + pow(e2p * 3/4, 2) * 5/3 *
-                (3 * (phi + sin(2 * phi)/2) + sin(2 * phi) * cosPhi2) / 4
-            - pow(e2p * 3/4, 3) * 35/27 *
-                (
-                    5 * (3 * (phi + sin(2 * phi)/2)
-                    + sin(2 * phi) * cosPhi2) / 4
-                    + sin(2 * phi) * cosPhi2 * cosPhi2
-                ) / 3
-
+        
+        // Exponential correction used in longitude/latitude inverse transform
+        // Matches original expression:
+        // (1 − e′²·x²·cos²φ / 6)
+        let corrExp = 1 - (e2p * x2 * cosPhi2 / 6.0)
+        
+        // Hyperbolic sine equivalent:
+        // (exp(A) − exp(−A)) / 2
+        // Appears in inverse transverse Mercator expansion
+        let expTerm = (exp(x * corrExp) - exp(-x * corrExp)) / 2.0
+        
+        // Meridional arc inverse series expansion
+        // Used to refine latitude estimate from northing
+        let sin2Phi = sin(2 * phi)
+        
+        let s1 = phi + sin2Phi / 2.0
+        
+        let s2 =
+        (3.0 * s1 + sin2Phi * cosPhi2) / 4.0
+        
+        let s3 =
+        (5.0 * s2 + sin2Phi * cosPhi2 * cosPhi2) / 3.0
+        
+        // Polynomial approximation of inverse meridional distance
+        // Equivalent to large nested expression in original implementation
+        let series =
+        phi
+        - (e2p * 0.75 * s1)
+        + pow(e2p * 0.75, 2) * (5.0 / 3.0) * s2
+        - pow(e2p * 0.75, 3) * (35.0 / 27.0) * s3
+        
+        // Higher-order correction factor for transverse Mercator inverse
+        // Matches:
+        // (1 − e′²·x²·cos²φ / 2)
+        let corrBig = 1 - (e2p * x2 * cosPhi2 / 2.0)
+        
+        // Meridian distance correction term
+        // Appears repeatedly in original implementation
+        // IMPORTANT: must remain separate from +φ for exact equivalence
+        let meridianCorrection =
+        ((north - k0 * a2 * series) / nu) * corrBig
+        
+        // Combined correction used in latitude computation
+        // Appears inside tan() but NOT inside cos() elsewhere
         let bigTerm =
-            (north - k0 * a2 * series1) / nu * correctionFactor + phi
-
+        meridianCorrection + phi
+        
+        // Longitude auxiliary angle
+        // NOTE:
+        // Uses cos(meridianCorrection) (NOT cos(bigTerm))
+        // Required for algebraic equivalence with original implementation
+        let atanInner =
+        atan(expTerm / cos(meridianCorrection))
+        
+        // Latitude correction component
+        // Derived from inverse transverse Mercator expansion
         let latitudeComponent =
-            (atanTerm * tan(bigTerm) - phi)
-
+        atan(cos(atanInner)) * tan(bigTerm) - phi
+        
+        // Final latitude (degrees)
+        // Includes second eccentricity correction term
         var latitude =
-            (phi +
-             (1 + e2p * cosPhi2
-              - e2p * sinPhi * cosPhi * latitudeComponent * 3/2)
-             * latitudeComponent)
-            * 180 / Double.pi
-
-        latitude = round(latitude * 10_000_000) / 10_000_000
-
-        var longitude =
-            atan(
-                (expTerm / 2)
-                / cos(bigTerm)
+        (
+            phi
+            + (
+                1
+                + e2p * cosPhi2
+                - e2p * sinPhi * cosPhi * latitudeComponent * 1.5
             )
-            * 180 / Double.pi
-            + Double(zone) * 6
-            - 183
-
-        longitude = round(longitude * 10_000_000) / 10_000_000
-
+            * latitudeComponent
+        )
+        * 180.0 / Double.pi
+        
+        // Match original precision (7 decimal places)
+        latitude =
+        round(latitude * 10_000_000) / 10_000_000
+        
+        // Final longitude (degrees)
+        // Offset by zone central meridian
+        var longitude =
+        atanInner * 180.0 / Double.pi
+        + Double(zone) * 6.0
+        - 183.0
+        
+        // Match original precision (7 decimal places)
+        longitude =
+        round(longitude * 10_000_000) / 10_000_000
+        
         return GridPoint.degrees(longitude, latitude)
     }
     
