@@ -81,130 +81,103 @@ public class UTM {
     }
     
     /**
-     * Convert to a point
+     * Code from: https://www.movable-type.co.uk/scripts/latlong-utm-mgrs.html translated into swift
+     * Converts UTM zone/easting/northing coordinate to latitude/longitude.
      *
-     * @return point
+     * Implements Karney’s method, using Krüger series to order n⁶, giving results accurate to 5nm
+     * for distances up to 3900km from the central meridian.
+     *
+     * @param   {Utm} utmCoord - UTM coordinate to be converted to latitude/longitude.
+     * @returns {LatLon} Latitude/longitude of supplied grid reference.
+     *
+     * @example
+     *   const grid = new Utm(31, 'N', 448251.795, 5411932.678);
+     *   const latlong = grid.toLatLon(); // 48°51′29.52″N, 002°17′40.20″E
      */
     public func toPoint() -> GridPoint {
+        let falseEasting = 500000.0, falseNorthing = 10000000.0;
+        let a = 6_378_137.0
+        let f = 1.0 / 298.257223563
+        //
+        let k0 = 0.9996; // UTM scale on the central meridian
+
+        let x = easting - falseEasting;                            // make x ± relative to central meridian
+        let y = hemisphere == .SOUTH ? northing - falseNorthing : northing; // make y ± relative to equator
+
+        // ---- from Karney 2011 Eq 15-22, 36:
         
-        // Remove southern hemisphere false northing (UTM convention)
-        // Southern hemisphere northings are offset by +10,000,000 meters
-        var north = northing
-        if hemisphere == .SOUTH {
-            north -= 10_000_000.0
+        let e = sqrt(f*(2-f)); // eccentricity
+        let n = f / (2 - f);        // 3rd flattening
+        let n2 = n*n, n3 = n*n2, n4 = n*n3, n5 = n*n4, n6 = n*n5;
+
+        let A = a/(1+n) * (1 + 1/4*n2 + 1/64*n4 + 1/256*n6); // 2πA is the circumference of a meridian
+
+        let eta = x / (k0*A);
+        let xi = y / (k0*A);
+
+        let beta = [ 0, // note beta is one-based array (6th order Krüger expressions)
+                    1/2*n - 2/3*n2 + 37/96*n3 -    1/360*n4 -   81/512*n5 +    96199/604800*n6,
+                    1/48*n2 +  1/15*n3 - 437/1440*n4 +   46/105*n5 - 1118711/3870720*n6,
+                    17/480*n3 -   37/840*n4 - 209/4480*n5 +      5569/90720*n6,
+                    4397/161280*n4 -   11/504*n5 -  830251/7257600*n6,
+                    4583/161280*n5 -  108847/3991680*n6,
+                    20648693/638668800*n6 ];
+        
+        var xiPrime = xi;
+        for j in 1...6 {
+            let doubleJ = Double(j);
+            xiPrime -= beta[j] * sin(2*doubleJ*xi) * cosh(2*doubleJ*eta);
         }
         
-        // UTM / ellipsoid constants (match original implementation exactly)
-        let k0 = 0.9996              // UTM central meridian scale factor
-        let e2p = 0.006739496742     // second eccentricity squared (e′²)
-        let a1 = 6366197.724         // meridional radius scaling constant
-        let a2 = 6399593.625         // transverse radius scaling constant
+        var etaPrime = eta;
+        for j in 1...6 {
+            let doubleJ = Double(j);
+            etaPrime -= beta[j] * cos(2*doubleJ*xi) * sinh(2*doubleJ*eta);
+        }
         
-        // Footpoint latitude approximation (φ₁)
-        // Equivalent to north / (a1 * k0)
-        let phi = north / (a1 * k0)
+        let sinhetaPrime = sinh(etaPrime);
+        let sinxiPrime = sin(xiPrime), cosxiPrime = cos(xiPrime);
+
+        let tauPrime = sinxiPrime / sqrt(sinhetaPrime*sinhetaPrime + cosxiPrime*cosxiPrime);
+
+        var deltataui: Double = Double.greatestFiniteMagnitude;
+        var taui = tauPrime;
+        repeat {
+            let sigmai = sinh(e*atanh(e*taui/sqrt(1+taui*taui)));
+            let tauiPrime = taui * sqrt(1+sigmai*sigmai) - sigmai * sqrt(1+taui*taui);
+            deltataui = (tauPrime - tauiPrime)/sqrt(1+tauiPrime*tauiPrime)
+            * (1 + (1-e*e)*taui*taui) / ((1-e*e)*sqrt(1+taui*taui));
+            taui += deltataui;
+        } while (abs(deltataui) > 1e-12); // using IEEE 754 deltataui -> 0 after 2-3 iterations
+        // note relatively large convergence test as deltataui toggles on ±1.12e-16 for eg 31 N 400000 5000000
+        let tau = taui;
+
+        let phi = atan(tau);
+
+        var lambda = atan2(sinhetaPrime, cosxiPrime);
+
+        // ---- convergence: Karney 2011 Eq 26, 27
         
-        // Precompute trig values used repeatedly
-        let sinPhi = sin(phi)
-        let cosPhi = cos(phi)
-        let cosPhi2 = cosPhi * cosPhi
+        var p = 1.0;
+        for j in 1...6 {
+            let doubleJ = Double(j);
+            p -= 2*doubleJ*beta[j] * cos(2*doubleJ*xi) * cosh(2*doubleJ*eta);
+        }
+        var q = 0.0;
+        for j in 1...6 {
+            let doubleJ = Double(j);
+            q += 2*doubleJ*beta[j] * sin(2*doubleJ*xi) * sinh(2*doubleJ*eta);
+        }
+
+        // ------------
         
-        // Radius of curvature in the prime vertical (ν)
-        // Adjusted by UTM scale factor
-        let nu = (k0 * a2) / sqrt(1 + e2p * cosPhi2)
+        let lambda0 = ((Double(zone)-1)*6 - 180 + 3).toRadians; // longitude of central meridian
+        lambda += lambda0; // move lambda from zonal to global coordinates
         
-        // Normalized easting relative to central meridian
-        let x = (easting - 500000.0) / nu
-        let x2 = x * x
-        
-        // Exponential correction used in longitude/latitude inverse transform
-        // Matches original expression:
-        // (1 − e′²·x²·cos²φ / 6)
-        let corrExp = 1 - (e2p * x2 * cosPhi2 / 6.0)
-        
-        // Hyperbolic sine equivalent:
-        // (exp(A) − exp(−A)) / 2
-        // Appears in inverse transverse Mercator expansion
-        let expTerm = (exp(x * corrExp) - exp(-x * corrExp)) / 2.0
-        
-        // Meridional arc inverse series expansion
-        // Used to refine latitude estimate from northing
-        let sin2Phi = sin(2 * phi)
-        
-        let s1 = phi + sin2Phi / 2.0
-        
-        let s2 =
-        (3.0 * s1 + sin2Phi * cosPhi2) / 4.0
-        
-        let s3 =
-        (5.0 * s2 + sin2Phi * cosPhi2 * cosPhi2) / 3.0
-        
-        // Polynomial approximation of inverse meridional distance
-        // Equivalent to large nested expression in original implementation
-        let series =
-        phi
-        - (e2p * 0.75 * s1)
-        + pow(e2p * 0.75, 2) * (5.0 / 3.0) * s2
-        - pow(e2p * 0.75, 3) * (35.0 / 27.0) * s3
-        
-        // Higher-order correction factor for transverse Mercator inverse
-        // Matches:
-        // (1 − e′²·x²·cos²φ / 2)
-        let corrBig = 1 - (e2p * x2 * cosPhi2 / 2.0)
-        
-        // Meridian distance correction term
-        // Appears repeatedly in original implementation
-        // IMPORTANT: must remain separate from +φ for exact equivalence
-        let meridianCorrection =
-        ((north - k0 * a2 * series) / nu) * corrBig
-        
-        // Combined correction used in latitude computation
-        // Appears inside tan() but NOT inside cos() elsewhere
-        let bigTerm =
-        meridianCorrection + phi
-        
-        // Longitude auxiliary angle
-        // NOTE:
-        // Uses cos(meridianCorrection) (NOT cos(bigTerm))
-        // Required for algebraic equivalence with original implementation
-        let atanInner =
-        atan(expTerm / cos(meridianCorrection))
-        
-        // Latitude correction component
-        // Derived from inverse transverse Mercator expansion
-        let latitudeComponent =
-        atan(cos(atanInner)) * tan(bigTerm) - phi
-        
-        // Final latitude (degrees)
-        // Includes second eccentricity correction term
-        var latitude =
-        (
-            phi
-            + (
-                1
-                + e2p * cosPhi2
-                - e2p * sinPhi * cosPhi * latitudeComponent * 1.5
-            )
-            * latitudeComponent
-        )
-        * 180.0 / Double.pi
-        
-        // Match original precision (7 decimal places)
-        latitude =
-        round(latitude * 10_000_000) / 10_000_000
-        
-        // Final longitude (degrees)
-        // Offset by zone central meridian
-        var longitude =
-        atanInner * 180.0 / Double.pi
-        + Double(zone) * 6.0
-        - 183.0
-        
-        // Match original precision (7 decimal places)
-        longitude =
-        round(longitude * 10_000_000) / 10_000_000
-        
-        return GridPoint.degrees(longitude, latitude)
+        // round to reasonable precision
+        let lat = phi.degrees.roundTo(places: 14) // nm precision (1nm = 10^-14°)
+        let lon = lambda.degrees.roundTo(places: 14) // (strictly lat rounding should be phi⋅cosphi!)
+        return GridPoint.degrees(lon, lat)
     }
     
     /**
@@ -335,7 +308,7 @@ public class UTM {
      *            hemisphere
      * @return UTM
      */
-    public static func from(_ point: GridPoint, _ zone: Int, _ hemisphere: Hemisphere) -> UTM {
+    public static func fromOriginal(_ point: GridPoint, _ zone: Int, _ hemisphere: Hemisphere) -> UTM {
 
         let pointDegrees = point.toDegrees()
 
@@ -354,6 +327,125 @@ public class UTM {
         northing = round(northing * 100) * 0.01
 
         return UTM(zone, hemisphere, easting, northing)
+    }
+
+    /**
+     * Code from: https://www.movable-type.co.uk/scripts/latlong-utm-mgrs.html translated into swift
+     * Converts latitude/longitude to UTM coordinate.
+     *
+     * Implements Karney’s method, using Krüger series to order n⁶, giving results accurate to 5nm
+     * for distances up to 3900km from the central meridian.
+     *
+     * @param   {number} [zoneOverride] - Use specified zone rather than zone within which point lies;
+     *          note overriding the UTM zone has the potential to result in negative eastings, and
+     *          perverse results within Norway/Svalbard exceptions.
+     * @returns {Utm} UTM coordinate.
+     * @throws  {TypeError} Latitude outside UTM limits.
+     *
+     * @example
+     *   const latlong = new LatLon(48.8582, 2.2945);
+     *   const utmCoord = latlong.toUtm(); // 31 N 448252 5411933
+     */
+    public static func from(_ point: GridPoint, _ zoneOverride: Int, _ hemisphere: Hemisphere) -> UTM {
+        
+        let pointDegrees = point.toDegrees()
+        
+        let latitude = pointDegrees.latitude
+        let longitude = pointDegrees.longitude
+        
+        let falseEasting = 500000.0, falseNorthing = 10000000.0;
+
+        var zone = floor((longitude+180)/6) + 1; // longitudinal zone
+        var lambda0 = ((zone-1)*6 - 180 + 3).toRadians; // longitude of central meridian
+        
+        // ---- handle Norway/Svalbard exceptions
+        // grid zones are 8° tall; 0°N is offset 10 into latitude bands array
+        let mgrsLatBands = ["C","D","E","F","G","H","J","K","L","M","N","P","Q","R","S","T","U","V","W","X","X"]; // X is repeated for 80-84°N
+        let latBand = mgrsLatBands[Int(floor(latitude/8+10))];
+        // adjust zone & central meridian for Norway
+        if (zone == 31 && latBand == "V" && longitude >= 3) { zone += 1; lambda0 += (6).toRadians; }
+        // adjust zone & central meridian for Svalbard
+        if (zone==32 && latBand=="X" && longitude <  9) { zone -= 1; lambda0 -= (6).toRadians; }
+        if (zone==32 && latBand=="X" && longitude >= 9) { zone += 1; lambda0 += (6).toRadians; }
+        if (zone==34 && latBand=="X" && longitude < 21) { zone -= 1; lambda0 -= (6).toRadians; }
+        if (zone==34 && latBand=="X" && longitude >= 21) { zone += 1; lambda0 += (6).toRadians; }
+        if (zone==36 && latBand=="X" && longitude < 33) { zone -= 1; lambda0 -= (6).toRadians; }
+        if (zone==36 && latBand=="X" && longitude >= 33) { zone += 1; lambda0 += (6).toRadians; }
+
+        let phi = latitude.toRadians;      // latitude ± from equator
+        let lambda = longitude.toRadians - lambda0; // longitude ± from central meridian
+        
+        let a = 6_378_137.0
+        let f = 1.0 / 298.257223563
+        
+        let k0 = 0.9996; // UTM scale on the central meridian
+
+        // ---- easting, northing: Karney 2011 Eq 7-14, 29, 35:
+        
+        let e = sqrt(f*(2-f)); // eccentricity
+        let n = f / (2 - f);        // 3rd flattening
+        let n2 = n*n, n3 = n*n2, n4 = n*n3, n5 = n*n4, n6 = n*n5;
+
+        let coslambda = cos(lambda)
+        let sinlambda = sin(lambda)
+
+        let tau = tan(phi); // tau ≡ tanphi, tauʹ ≡ tanphiʹ; prime (ʹ) indicates angles on the conformal sphere
+        let sigma = sinh(e*atanh(e*tau/sqrt(1+tau*tau)));
+
+        let tauPrime = tau*sqrt(1+sigma*sigma) - sigma*sqrt(1+tau*tau);
+
+        let xiPrime = atan2(tauPrime, coslambda);
+        let etaPrime = asinh(sinlambda / sqrt(tauPrime*tauPrime + coslambda*coslambda));
+
+        let A = a/(1+n) * (1 + 1/4*n2 + 1/64*n4 + 1/256*n6); // 2πA is the circumference of a meridian
+
+        let alpha: [Double] = [ Double(0), // note α is one-based array (6th order Krüger expressions)
+                          Double(1/2*n - 2/3*n2 + 5/16*n3 +   41/180*n4 -     127/288*n5 +      7891/37800*n6),
+                          Double(13/48*n2 -  3/5*n3 + 557/1440*n4 +     281/630*n5 - 1983433/1935360*n6),
+                          Double(61/240*n3 -  103/140*n4 + 15061/26880*n5 +   167603/181440*n6),
+                          Double(49561/161280*n4 -     179/168*n5 + 6601661/7257600*n6),
+                          Double(34729/80640*n5 - 3418889/1995840*n6),
+                          Double(212378941/319334400*n6) ];
+        
+        var xi = xiPrime;
+        for j in 1...6 {
+            let doubleJ = Double(j);
+            xi += alpha[j] * sin(2.0*doubleJ*xiPrime) * cosh(2.0*doubleJ*etaPrime);
+        }
+        
+        var eta = etaPrime;
+        for j in 1...6 {
+            let doubleJ = Double(j);
+            eta += alpha[j] * cos(2*doubleJ*xiPrime) * sinh(2*doubleJ*etaPrime);
+        }
+        
+        var x = k0 * A * eta;
+        var y = k0 * A * xi;
+
+        // ---- convergence: Karney 2011 Eq 23, 24
+        
+        var pPrime = 1.0;
+        for j in 1...6 {
+            let doubleJ = Double(j);
+            pPrime += 2*doubleJ*alpha[j] * cos(2*doubleJ*xiPrime) * cosh(2*doubleJ*etaPrime);
+        }
+        var qPrime = 0.0;
+        for j in 1...6 {
+            let doubleJ = Double(j);
+            qPrime += 2*doubleJ*alpha[j] * sin(2*doubleJ*xiPrime) * sinh(2*doubleJ*etaPrime);
+        }
+
+        // ------------
+        
+        // shift x/y to false origins
+        x = x + falseEasting;             // make x relative to false easting
+        if (y < 0) {
+            y = y + falseNorthing; // make y in southern hemisphere relative to false northing
+        }
+        
+        x = floor(x)
+        y = floor(y)
+        return UTM(Int(zone), hemisphere, x, y)
     }
     
     /**
@@ -609,4 +701,18 @@ public class UTM {
         return from(longitude, latitude, unit, zone, hemisphere).format()
     }
     
+}
+
+extension Double {
+    var toRadians: Double { return self * .pi / 180 }
+    
+    var degrees: Double {
+        // The formula is: Radians = Degrees * pi / 180
+        return self * 180 / .pi
+    }
+    
+    func roundTo(places: Int) -> Double {
+        let divisor = pow(10.0, Double(places))
+        return (self * divisor).rounded() / divisor
+    }
 }
