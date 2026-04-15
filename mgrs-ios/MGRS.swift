@@ -391,7 +391,6 @@ public class MGRS: Hashable {
 
         let pointDegrees = (point.mutableCopy() as! GridPoint).toDegrees()
 
-        print("point degrees initial \(pointDegrees.latitude), \(pointDegrees.longitude)")
         // Bound the latitude if needed
         if pointDegrees.latitude < MGRSConstants.MIN_LAT {
             pointDegrees.latitude = MGRSConstants.MIN_LAT
@@ -401,7 +400,6 @@ public class MGRS: Hashable {
         
         // Normalize the longitude if needed
         SFGeometryUtils.normalizeWGS84Geometry(pointDegrees)
-        print("point degrees final \(pointDegrees.latitude), \(pointDegrees.longitude)")
         let utm = UTM.from(pointDegrees)
 
         let bandLetter = GridZones.bandLetter(pointDegrees.latitude)
